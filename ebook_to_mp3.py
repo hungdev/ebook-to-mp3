@@ -56,12 +56,12 @@ class HTMLTextExtractor(HTMLParser):
         return text.strip()
 
 
-def read_text_from_epub(epub_path: Path) -> str:
+def read_text_from_epub(epub_path: Path) -> List[Section]:
     with zipfile.ZipFile(epub_path, "r") as zf:
         html_files = [name for name in zf.namelist() if name.lower().endswith((".xhtml", ".html", ".htm"))]
         if not html_files:
             raise ValueError("Không tìm thấy nội dung XHTML/HTML trong file EPUB.")
-        texts: List[str] = []
+        sections: List[Section] = []
         for name in sorted(html_files):
             with zf.open(name) as fp:
                 raw_bytes = fp.read()
@@ -78,13 +78,13 @@ def read_text_from_epub(epub_path: Path) -> str:
             extractor.close()
             page_text = extractor.get_text()
             if page_text:
-                texts.append(page_text)
-        return "\n\n".join(texts)
+                lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+                title = lines[0][:80] if lines else Path(name).stem
+                sections.append(Section(title=title, text=page_text))
+        return sections
 
 
-def read_text(input_path: Path) -> str:
-    if input_path.suffix.lower() == ".epub":
-        return read_text_from_epub(input_path)
+def read_plain_text(input_path: Path) -> str:
     encoding_candidates = ["utf-8", "utf-16", "utf-16le", "utf-16be", "latin-1"]
     raw_bytes = input_path.read_bytes()
     for encoding in encoding_candidates:
@@ -95,11 +95,50 @@ def read_text(input_path: Path) -> str:
     return raw_bytes.decode("utf-8", errors="ignore")
 
 
+def read_text(input_path: Path) -> str:
+    if input_path.suffix.lower() == ".epub":
+        sections = read_text_from_epub(input_path)
+        return "\n\n".join(section.text for section in sections)
+    return read_plain_text(input_path)
+
+
 def sanitize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\t+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def split_plain_text_by_marker(text: str, marker: str) -> List[Section]:
+    pattern = re.compile(marker, re.MULTILINE)
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return []
+
+    sections: List[Section] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        chunk = text[start:end].strip()
+        if not chunk:
+            continue
+        title = match.group().strip() or f"Phần {index + 1}"
+        sections.append(Section(title=title, text=chunk))
+    return sections
+
+
+def read_sections(input_path: Path, split_marker: Optional[str]) -> List[Section]:
+    if input_path.suffix.lower() == ".epub":
+        sections = read_text_from_epub(input_path)
+        return [Section(title=section.title, text=sanitize_text(section.text)) for section in sections if section.text.strip()]
+
+    raw_text = read_plain_text(input_path)
+    sanitized = sanitize_text(raw_text)
+    if split_marker:
+        marker_sections = split_plain_text_by_marker(sanitized, split_marker)
+        if marker_sections:
+            return marker_sections
+    return [Section(title=input_path.stem, text=sanitized)]
 
 
 @dataclass
@@ -108,6 +147,14 @@ class ConversionOptions:
     voice: Optional[str]
     rate: Optional[int]
     prefer: List[str]
+
+
+@dataclass
+class Section:
+    """Represents a logical chunk of ebook text (e.g., chapter)."""
+
+    title: str
+    text: str
 
 
 def ensure_command_available(command: str) -> None:
@@ -249,21 +296,94 @@ def synthesize_with_gtts(text: str, output_file: Path) -> None:
     if output_file.exists():
         output_file.unlink()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_dir = Path(tmpdir)
-        for index, chunk in enumerate(chunks, start=1):
-            temp_mp3 = tmp_dir / f"chunk_{index:04d}.mp3"
-            tts = gTTS(text=chunk, lang="vi")
-            tts.save(str(temp_mp3))
-            with temp_mp3.open("rb") as src, output_file.open("ab") as dst:
-                shutil.copyfileobj(src, dst)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_dir = Path(tmpdir)
+            for index, chunk in enumerate(chunks, start=1):
+                temp_mp3 = tmp_dir / f"chunk_{index:04d}.mp3"
+                tts = gTTS(text=chunk, lang="vi")
+                try:
+                    tts.save(str(temp_mp3))
+                except Exception as exc:  # pragma: no cover - depends on network availability
+                    raise RuntimeError("gTTS gặp lỗi khi kết nối tới dịch vụ.") from exc
+                with temp_mp3.open("rb") as src, output_file.open("ab") as dst:
+                    shutil.copyfileobj(src, dst)
+    except RuntimeError:
+        if output_file.exists():
+            output_file.unlink(missing_ok=True)
+        raise
+
+
+def chunk_text_by_word_limit(text: str, max_words: int) -> List[str]:
+    if max_words <= 0:
+        return [text.strip()] if text.strip() else []
+
+    words = text.split()
+    if len(words) <= max_words:
+        return [text.strip()] if text.strip() else []
+
+    chunks: List[str] = []
+    current_words: List[str] = []
+    current_count = 0
+
+    for paragraph in text.split("\n\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        para_words = paragraph.split()
+        if current_count and current_count + len(para_words) > max_words:
+            chunks.append("\n\n".join(current_words))
+            current_words = []
+            current_count = 0
+
+        if len(para_words) > max_words:
+            if current_words:
+                chunks.append("\n\n".join(current_words))
+                current_words = []
+                current_count = 0
+            # Break long paragraph into equal word blocks.
+            for idx in range(0, len(para_words), max_words):
+                slice_words = para_words[idx : idx + max_words]
+                chunk = " ".join(slice_words).strip()
+                if chunk:
+                    chunks.append(chunk)
+            continue
+
+        current_words.append(paragraph)
+        current_count += len(para_words)
+
+    if current_words:
+        chunks.append("\n\n".join(current_words))
+
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def split_sections_by_duration(sections: List[Section], target_seconds: float, words_per_minute: int) -> List[Section]:
+    if target_seconds <= 0:
+        raise ValueError("target_seconds phải lớn hơn 0.")
+    if words_per_minute <= 0:
+        raise ValueError("words_per_minute phải lớn hơn 0.")
+
+    max_words = max(1, int(words_per_minute * (target_seconds / 60.0)))
+    output_sections: List[Section] = []
+    for section in sections:
+        chunks = chunk_text_by_word_limit(section.text, max_words)
+        if not chunks:
+            continue
+        if len(chunks) == 1:
+            output_sections.append(Section(title=section.title, text=chunks[0]))
+        else:
+            for idx, chunk in enumerate(chunks, start=1):
+                title = f"{section.title} (phần {idx})"
+                output_sections.append(Section(title=title, text=chunk))
+    return output_sections
 
 
 def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Chuyển sách điện tử tiếng Việt thành file MP3 với giọng đọc tự nhiên (macOS 'say' hoặc gTTS).")
     parser.add_argument("input", type=Path, nargs="?", help="Đường dẫn đến ebook (.txt, .epub)")
-    parser.add_argument("output", type=Path, nargs="?", help="Đường dẫn file .mp3 đầu ra")
+    parser.add_argument("output", type=Path, nargs="?", help="Đường dẫn file .mp3 đầu ra hoặc tiền tố khi tách nhiều file")
     parser.add_argument("--engine", choices=["say", "gtts"], default="say", help="Chọn bộ máy tổng hợp giọng (mặc định: say).")
     parser.add_argument("--voice", help="Tên giọng đọc (chỉ áp dụng với engine 'say').")
     parser.add_argument("--rate", type=int, help="Tốc độ đọc (từ/phút, chỉ áp dụng với 'say').")
@@ -272,6 +392,27 @@ def parse_arguments(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         nargs="*",
         choices=["ffmpeg", "afconvert"],
         help="Ưu tiên bộ chuyển đổi âm thanh (mặc định: ffmpeg rồi afconvert).",
+    )
+    parser.add_argument(
+        "--split-mode",
+        choices=["none", "sections", "duration"],
+        default="none",
+        help="none: 1 file; sections: mỗi chương/đoạn; duration: tách theo thời lượng ước lượng.",
+    )
+    parser.add_argument(
+        "--split-marker",
+        help="Biểu thức regex xác định đầu mỗi chương (áp dụng cho file .txt khi dùng split-mode=sections).",
+    )
+    parser.add_argument(
+        "--target-seconds",
+        type=float,
+        help="Thời lượng mong muốn cho mỗi file khi split-mode=duration (ví dụ 900 cho 15 phút).",
+    )
+    parser.add_argument(
+        "--words-per-minute",
+        type=int,
+        default=160,
+        help="Tốc độ đọc ước lượng (dùng cho split-mode=duration).",
     )
     parser.add_argument("--list-voices", action="store_true", help="Hiển thị danh sách giọng đọc và thoát")
     return parser.parse_args(argv)
@@ -294,45 +435,100 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     engine = args.engine
     if engine == "gtts" and (args.voice or args.rate):
         print("Cảnh báo: --voice và --rate chỉ áp dụng với engine 'say'.", file=sys.stderr)
+    split_mode = args.split_mode
+    split_marker = args.split_marker if split_mode == "sections" else None
+    target_seconds = args.target_seconds
+    words_per_minute = args.words_per_minute
+
     if not output_path.parent.exists():
-        print(f"Thư mục đầu ra không tồn tại: {output_path.parent}", file=sys.stderr)
-        return 1
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     if not input_path.exists():
         print(f"Không tìm thấy file đầu vào: {input_path}", file=sys.stderr)
         return 1
     try:
-        raw_text = read_text(input_path)
+        sections = read_sections(input_path, split_marker)
     except Exception as exc:  # pylint: disable=broad-except
         print(f"Lỗi đọc file: {exc}", file=sys.stderr)
         return 1
-    text = sanitize_text(raw_text)
-    if not text:
-        print("File đầu vào không có nội dung hợp lệ.", file=sys.stderr)
+    if not sections:
+        print("Không tìm thấy nội dung hợp lệ trong ebook.", file=sys.stderr)
         return 1
+
+    if split_mode == "none":
+        combined = "\n\n".join(section.text for section in sections if section.text.strip())
+        if not combined.strip():
+            print("File đầu vào không có nội dung hợp lệ.", file=sys.stderr)
+            return 1
+        segments = [Section(title=output_path.stem or "segment", text=combined)]
+    elif split_mode == "sections":
+        segments = [section for section in sections if section.text.strip()]
+        if not segments:
+            print("Không có chương/đoạn nào sau khi tách.", file=sys.stderr)
+            return 1
+    elif split_mode == "duration":
+        if target_seconds is None:
+            print("Cần chỉ định --target-seconds khi dùng split-mode=duration.", file=sys.stderr)
+            return 2
+        try:
+            segments = split_sections_by_duration(sections, target_seconds, words_per_minute)
+        except ValueError as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 2
+        if not segments:
+            print("Không thể tách nội dung theo thời lượng yêu cầu.", file=sys.stderr)
+            return 1
+    else:  # pragma: no cover - safeguarded by argparse choices
+        print(f"split-mode không được hỗ trợ: {split_mode}", file=sys.stderr)
+        return 2
+
+    suffix = output_path.suffix or ".mp3"
+    stem = output_path.stem if output_path.suffix else output_path.name
+    if not stem:
+        stem = "output"
+
+    if len(segments) == 1:
+        output_files = [output_path if output_path.suffix else output_path.with_suffix(suffix)]
+    else:
+        output_dir = output_path.parent
+        output_files = [output_dir / f"{stem}_{index:03d}{suffix}" for index in range(1, len(segments) + 1)]
+
     options = ConversionOptions(engine=engine, voice=args.voice, rate=args.rate, prefer=args.prefer or [])
+
+    produced_files: List[Path] = []
 
     if engine == "say":
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_dir = Path(tmpdir)
-            tmp_text = tmp_dir / "input.txt"
-            tmp_aiff = tmp_dir / "voice.aiff"
-            tmp_text.write_text(text, encoding="utf-8")
             try:
-                call_say(tmp_text, tmp_aiff, options)
-                convert_audio(tmp_aiff, output_path, options)
+                for index, (segment, destination) in enumerate(zip(segments, output_files), start=1):
+                    tmp_text = tmp_dir / f"input_{index:04d}.txt"
+                    tmp_aiff = tmp_dir / f"voice_{index:04d}.aiff"
+                    tmp_text.write_text(segment.text, encoding="utf-8")
+                    call_say(tmp_text, tmp_aiff, options)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    convert_audio(tmp_aiff, destination, options)
+                    produced_files.append(destination)
             except RuntimeError as exc:
                 print(exc, file=sys.stderr)
                 return 1
     elif engine == "gtts":
-        try:
-            synthesize_with_gtts(text, output_path)
-        except RuntimeError as exc:
-            print(exc, file=sys.stderr)
-            return 1
+        for segment, destination in zip(segments, output_files):
+            try:
+                synthesize_with_gtts(segment.text, destination)
+                produced_files.append(destination)
+            except RuntimeError as exc:
+                print(exc, file=sys.stderr)
+                return 1
     else:  # pragma: no cover - guarded by argparse choices
         print(f"Engine không được hỗ trợ: {engine}", file=sys.stderr)
         return 2
-    print(f"Đã tạo file MP3: {output_path}")
+
+    if len(produced_files) == 1:
+        print(f"Đã tạo file MP3: {produced_files[0]}")
+    else:
+        print("Đã tạo các file MP3:")
+        for path in produced_files:
+            print(f" - {path}")
     return 0
 
 
