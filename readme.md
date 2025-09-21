@@ -62,9 +62,11 @@ Script ước lượng số từ dựa trên tốc độ đọc (`--words-per-mi
 
 ```bash
 python3 ebook_to_mp3.py book.epub book.mp3 \
-  --split-mode duration \
-  --target-seconds 900 \
-  --words-per-minute 170
+ --engine gtts \
+ --split-mode duration \
+ --target-seconds 900 \
+ --words-per-minute 238
+
 ```
 
 ## Tùy chọn quan trọng
@@ -85,9 +87,3 @@ python3 ebook_to_mp3.py book.epub book.mp3 \
 - Engine `gtts` cần Internet; nếu mất kết nối, script hủy file MP3 dở dang và báo lỗi.
 - Các file MP3 đầu ra sẽ được đặt trong cùng thư mục với `output` đã chỉ định.
 - Khi tách nhiều phần, `output` được hiểu là tiền tố; ví dụ `audiobook.mp3` -> `audiobook_001.mp3`, `audiobook_002.mp3`...
-
-python3 ebook_to_mp3.py book.epub book.mp3 \
- --engine gtts \
- --split-mode duration \
- --target-seconds 900 \
- --words-per-minute 238
